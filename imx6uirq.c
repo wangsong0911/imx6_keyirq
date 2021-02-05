@@ -48,6 +48,7 @@ struct imx6uirq_dev {
 	struct timer_list timer;				//定义一个定时器
 	struct irq_keydesc irqkeydesc[KEY_NUM];	//按键描述数组
 	unsigned char curkeynum;				//当前的按键号
+	wait_queue_head_t r_wait;	//读等待队列头
 };
 
 struct imx6uirq_dev imx6uirq;	//irq设备
@@ -90,6 +91,12 @@ void timer_function(unsigned long arg)
 	}else { 								//按键松开 
 		atomic_set(&dev->keyvalue, 0x80|keydesc->value);
 		atomic_set(&dev->releasekey, 1);	//标记松开按键，即完成一次完整的按键过程
+	}               
+
+		/* 唤醒进程 */
+		if(atomic_read(&dev->releasekey)) {	/* 完成一次按键过程 */
+			/* wake_up(&dev->r_wait); */
+			wake_up_interruptible(&dev->r_wait);
 	}	
 }
 
@@ -146,6 +153,9 @@ static int keyio_init(void)
 	/* 创建定时器 */
 	init_timer(&imx6uirq.timer);
 	imx6uirq.timer.function = timer_function;
+
+	/* 初始化等待队列头 */
+	init_waitqueue_head(&imx6uirq.r_wait);
 	return 0;
 }
 
@@ -177,6 +187,27 @@ static ssize_t imx6uirq_read(struct file *filp, char __user *buf, size_t cnt, lo
 	unsigned char releasekey = 0;
 	struct imx6uirq_dev *dev = (struct imx6uirq_dev *)filp->private_data;
 
+#if 0
+	/* 加入等待队列，等待被唤醒,也就是有按键按下 */
+ 	ret = wait_event_interruptible(dev->r_wait, atomic_read(&dev->releasekey)); 
+	if (ret) {
+		goto wait_error;
+	} 
+#endif
+
+	DECLARE_WAITQUEUE(wait, current);	//定义一个等待队列
+	if(atomic_read(&dev->releasekey) == 0) {	//没有按键按下
+		add_wait_queue(&dev->r_wait, &wait);	//将等待队列添加到等待队列头
+		__set_current_state(TASK_INTERRUPTIBLE);//设置任务状态
+		schedule();							//进行一次任务切换
+		if(signal_pending(current))	{			//判断是否为信号引起的唤醒
+			ret = -ERESTARTSYS;
+			goto wait_error;
+		}
+		__set_current_state(TASK_RUNNING);      //将当前任务设置为运行状态
+	    remove_wait_queue(&dev->r_wait, &wait);    //将对应的队列项从等待队列头删除
+	}
+
 	keyvalue = atomic_read(&dev->keyvalue);
 	releasekey = atomic_read(&dev->releasekey);
 
@@ -192,7 +223,12 @@ static ssize_t imx6uirq_read(struct file *filp, char __user *buf, size_t cnt, lo
 		goto data_error;
 	}
 	return 0;
-	
+
+wait_error:
+	set_current_state(TASK_RUNNING);		//设置任务为运行态
+	remove_wait_queue(&dev->r_wait, &wait);	//将等待队列移除
+	return ret;
+
 data_error:
 	return -EINVAL;
 }
